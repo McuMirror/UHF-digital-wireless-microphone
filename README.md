@@ -2,6 +2,8 @@
 
 UHF digital wireless microphone based on the arduino DUE and cheap SI446x modules with 26mhz oscillator.
 
+The project includes true diversity recievers and will hopfuly support embeded LTC timcode TX RX.
+
 This Code depends on;
 
 Radio modules driver , RadioHead RH_rf24  http://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF24.html
