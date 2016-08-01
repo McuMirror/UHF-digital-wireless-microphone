@@ -111,6 +111,8 @@ void setup() {
 
 /// initialise the circular buffer myQu
 initializeQueue(&myQueue); // initialise buffer
+initializeQueue(&adpcmQueue); // lets try anotherm not using yet but will try it
+
 
   initialcodec();  // initialize audio codec hardware
 
