@@ -1,0 +1,489 @@
+//
+//  Reciever Code  MONO audio
+//  Digital Wireless UHF radio mic with True Diversity Reciever & LTC timecode.
+//  Timecode cuurently disabled.
+//  WM8731 codec with I2S IO for Arduino Due
+//  radiohead RF24 recieving with 2 x modules in true diversity mode.
+//  if RSSI is = module1 is used otherwise strongest RSSI recieves 48 bit packet
+// 
+
+
+// include 2wire ( i2c )
+#include <Wire.h>
+
+// include necessary libraries
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// include libraries for UHF tx
+#include <SPI.h>
+#include <RH_RF24.h>
+
+// include IMA ADPCM encoder decoder lib
+#include <IMA_ADPCM.h>
+
+// instance of the radio driver now called rf24
+RH_RF24 rf24module1(10, 2, 9); // pin 10 cs, pin 2 inturrupt IRQ pin on module, Nsel ( power ) pin 9  
+RH_RF24 rf24module2(11, 3, 8); // pin 11 cs, pin 3 inturrupt IRQ pin on module, Nsel ( power ) pin 8
+
+// obstantiate IMA_ADPCM codec
+IMA_ADPCM decoderADPCM;  // make IMA_ADPCM instance for decoder
+
+
+// define & include stuff that libltc needs here
+#include "ltc.h"
+#include "encoder.h"
+#include "decoder.h"
+
+// define structures of circular buffer for samples IO
+
+#define MAX_ITEMS 128  // maximum curcular buffer size
+typedef struct circularQueue_s
+{
+    uint8_t     first;
+    uint8_t     last;
+    uint8_t    validItems;
+    uint8_t  data[MAX_ITEMS];  // i chaged the buffer from int to uint8_t 
+} circularQueue_t;
+
+uint8_t readValue;  // circular buffer read
+
+// prototypes of the functions // i don't understand this part , need to learn more
+// and explain here.. 
+
+void initializeQueue(circularQueue_t *theQueue);
+int isEmpty(circularQueue_t *theQueue);
+int putItem(circularQueue_t *theQueue, int theItemValue);
+int getItem(circularQueue_t *theQueue, int *theItemValue);
+void printQueue(circularQueue_t *theQueue);
+
+// end prototyping of functions for circular buffer,., explination needed...
+
+// circular buffer , difine a buffer? , I think you can have more than one ?
+circularQueue_t   myQueue;
+
+// uint32_t humpty[50];  // not used at the moment..
+uint16_t samples[48]; // 16bit word
+
+int16_t tempsamples[48]; /// temp adpcm samples recieved
+uint8_t tempadpcm[24]; // 4bit samples in least significant from decoder in 1 byte at a time.
+
+uint8_t packetmod1[48];   // recieve packet from module1
+uint8_t packetmod2[48];   // recieve packet from module2
+
+int flag = 1;  // rssi winner slect module
+int buffcount = 0;
+int packetready = 0;
+
+ int modcheck = 0;
+
+uint8_t RSSI1 = 2;
+uint8_t RSSI2 = 1;
+
+int samplesperframe = 1920;  // 48000khz / 25fps , samples per frame
+LTCDecoder *decoder;  //
+
+// WM8731 setup
+
+#define LINVOL 20
+#define RINVOL 20
+#define LHPVOL 127
+#define RHPVOL 127
+#define ADCHPD 0
+#define SIDEATT 0
+#define SIDETONE 0
+#define DACSEL 1
+#define BYPASS 0
+#define INSEL 1
+#define MUTEMIC 0
+#define MICBOOST 1
+#define SAMPLE_RATE 48
+#define BIT_RATE 32  // 16 24 or 32 bit modes  (  SSC I2S lib wants 32bit per channel, less bitrate is left justified in 32bit )
+
+
+// I2S IO library 
+
+#include <HiFi.h>
+
+void codecTxReadyInterrupt(HiFiChannelID_t);
+void codecRxReadyInterrupt(HiFiChannelID_t);
+
+uint32_t ldat = 0;
+uint32_t rdat = 0;
+
+void setup() {
+
+/// initialise the circular buffer myQu
+initializeQueue(&myQueue); // function to initialise circular buffer for samples input - RF out.
+
+initialcodec();  // initialize audio codec hardware
+
+// create ltc decoder called decoder with n samples per frame
+  decoder = ltc_decoder_create(samplesperframe, 0);  
+
+  Serial.begin(115200);
+
+ // Initialize the Arduino SSC codec
+
+  // set SSC DUE I2S codec into reset
+  pinMode(7, OUTPUT);
+  digitalWrite(7, LOW);
+
+  HiFi.begin();
+
+  // Configure transmitter for 2 channels, external TK/TF clocks, 32 bit per
+  // channel (data less than 32-bit is left justified in the 32 bit word, but
+  // codec config needs 32 clocks per channel).
+  HiFi.configureTx(HIFI_AUDIO_MODE_STEREO, HIFI_CLK_MODE_USE_EXT_CLKS, 32);
+
+  // Same config as above, except sync the receiver to transmitter (RK/RF
+  // clock signals not needed)
+  HiFi.configureRx(HIFI_AUDIO_MODE_STEREO, HIFI_CLK_MODE_USE_TK_RK_CLK, 32);
+
+  // Since we've decided to sync the receiver to the transmitter, we could
+  // handle both reading and writing in a single interrupt (receive or
+  // transmit).  This example uses both just for demonstration purposes.
+  HiFi.onTxReady(codecTxReadyInterrupt);
+  HiFi.onRxReady(codecRxReadyInterrupt);
+
+  // release codec from reset
+  digitalWrite(7, HIGH);
+
+  // Enable both receiver and transmitter.
+  HiFi.enableRx(true);
+  HiFi.enableTx(true);
+
+// initialze UHF RF24 TX module
+
+rf24module1.init();  // initialize rf module
+delay(100);
+rf24module2.init(); // initialize rf module2
+delay(100);
+ 
+// rf24module1.setFrequency(434.00);  //
+// rf24module2.setFrequency(434.00);  //
+ 
+ //  rf24module1.setTxPower(0x05);
+ //  rf24module2.setTxPower(0x05);
+ 
+ rf24module1.printRegisters(); // dump config module1 serial port
+ rf24module2.printRegisters(); // dump config module2 serial port
+
+}
+
+
+/// circular buffer functions start here
+
+
+// initialiseQueue function for circular buffer , set everything to zero
+void initializeQueue(circularQueue_t *theQueue)
+{
+    int i;
+    theQueue->validItems  =  0;
+    theQueue->first       =  0;
+    theQueue->last        =  0;
+    for(i=0; i<MAX_ITEMS; i++)
+    {
+        theQueue->data[i] = 0;
+    }        
+    return;
+}
+
+
+// isEmpty function verifies if the queue is empty
+int isEmpty(circularQueue_t *theQueue)
+{
+    if(theQueue->validItems==0)
+        return(1);
+    else
+        return(0);
+}
+
+
+// putItem function, verifies if there is space in the queue, and, in this case, add an item
+// at the end of the queue (theQueue->last element). Then it updates the value of theQueue->last 
+// the modulus operator is needed to stay into the boundaries of the array.
+
+int putItem(circularQueue_t *theQueue, uint8_t theItemValue)
+{
+    if(theQueue->validItems>=MAX_ITEMS)
+    {
+        printf("The queue is full\n");
+        printf("You cannot add items\n");
+        return(-1);
+    }
+    else
+    {
+        theQueue->validItems++;
+        theQueue->data[theQueue->last] = theItemValue;
+        theQueue->last = (theQueue->last+1)%MAX_ITEMS;
+    }
+}
+
+// getItem function returns -1 if the queue is empty, otherwise it takes the first element into the queue, 
+// then it updates the number of items and the first element of the queue (look at modulus operator).
+
+int getItem(circularQueue_t *theQueue, uint8_t *theItemValue)
+{
+    if(isEmpty(theQueue))
+    {
+       //  printf("isempty\n");
+        return(-1);
+    }
+    else
+    {
+        *theItemValue=theQueue->data[theQueue->first];
+        theQueue->first=(theQueue->first+1)%MAX_ITEMS;
+        theQueue->validItems--;
+        return(0);
+    }
+}
+
+
+// printQueue function, simply, prints validItems elements of theQueue starting from the theQueue->first element.
+// maybe I can modify this for the rf24.send(&data, len); and do away with the printQueue function
+// and call it void fireoffdata(circularQueue_t *theQueue)   ???
+
+void printQueue(circularQueue_t *theQueue)
+{
+    int aux, aux1;
+    aux  = theQueue->first;
+    aux1 = theQueue->validItems;
+    while(aux1>0)
+    {
+        printf("Element #%d = %d\n", aux, theQueue->data[aux]);
+        aux=(aux+1)%MAX_ITEMS;
+        aux1--;
+    }
+    return;
+}
+/// end circular buffer functions
+
+
+
+void loop() 
+
+ {
+
+
+
+// which modue has the better RSSI ?
+
+
+if (rf24module1.available())
+  {
+    
+    uint8_t buf[RH_RF24_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+     if (rf24module1.recv(packetmod1, &len))
+    {
+      
+  //     Serial.print("RSSI mod2: ");
+ // Serial.println((uint8_t)rf24module1.lastRssi(), DEC);
+      RSSI1 = ((uint8_t)rf24module1.lastRssi(), DEC);
+      }
+      }
+  
+if (rf24module2.available())
+  {
+    
+    uint8_t buf[RH_RF24_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+    if (rf24module2.recv(packetmod2, &len))
+    {  
+     
+ //     Serial.print("RSSI mod1: ");
+ // Serial.println((uint8_t)rf24module2.lastRssi(), DEC);
+     RSSI2 = ((uint8_t)rf24module2.lastRssi(), DEC);
+     
+      }
+      }
+    
+// got RSSI values from each module, which has a better signal ?
+
+if (RSSI1 > RSSI2 && buffcount == 0 );
+{
+  for(int i=0; i<24; i++) 
+     putItem(&myQueue, packetmod1[i]);   // load sample into circular buffer 
+}
+
+if (RSSI2 >= RSSI1 && buffcount == 0 );
+{
+  for(int i=0; i<24; i++) 
+  putItem(&myQueue, packetmod2[i]);   // load sample into circular buffer 
+}
+
+if (flag == 1 )
+{
+for(int i=0; i<24; i++)
+ {
+getItem(&myQueue, &readValue);  // get next available item from buffer
+tempsamples[i] = readValue;
+ }
+
+ // extract the last 4 bits then the fists 4 bits to make 48 samples of adpcm[i]
+for(int i=0; i<48; i = i + 2) 
+{
+tempadpcm[i] = tempsamples[i] << 4; // least significant 4 bits come first
+tempadpcm[i+1] = tempsamples[i];   // most significant bits 2nd
+}
+
+// decode ADPCM samples
+for(int i=0; i<24; i++) 
+{
+samples[i] = decoderADPCM.Decode (tempadpcm[i]); 
+}
+
+}
+
+ldat = ((samples[buffcount]) << 16);
+if ( ldat > 0) Serial.println(ldat);  // should be 8 bits here.. change this to print binary ..
+if ( buffcount >= 48 ) buffcount = 0;
+flag = 0; // got packet , reset flag if used.
+
+
+}  // close void loop 
+
+
+/// I2S IO loopthrough functions
+ void codecTxReadyInterrupt(HiFiChannelID_t channel)
+{
+  if (channel == HIFI_CHANNEL_ID_1)
+  {
+    // Left channel
+   HiFi.write(ldat);
+   flag = 1;
+   buffcount++;
+  }
+  else
+  {
+    // Right channel
+    //  HiFi.write(rdat);
+  }
+}
+
+void codecRxReadyInterrupt(HiFiChannelID_t channel)
+{
+  if (channel == HIFI_CHANNEL_ID_1)
+  {
+    //  Left channel
+    // ldat = HiFi.read(); 
+    
+  }
+  else
+  {
+    // Right channel
+     rdat = HiFi.read();  
+     
+   }  
+}
+
+/// initialise code function
+void initialcodec() {
+  
+ // Initialize the WM8731
+  Serial.println( "Initializing" );
+  delay(10);
+
+   Wire.begin();
+  Wire.beginTransmission(0x1e);
+  Wire.write(0x1e); // reset reg
+  Wire.write(B00000000); // do reset
+  Wire.endTransmission();
+
+// delay(50);
+
+   Wire.begin();
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x0c); // power reduction register
+  Wire.write(0x00); // turn everything on
+  Wire.endTransmission();
+
+  delay(10);
+
+   Wire.beginTransmission(0x1a);
+  Wire.write(0x0e); // digital data format REG 00001110   0x0e
+#if BIT_RATE == 32
+  Wire.write(0x72);  // 32bit,MASTER MODE  01110010  left justified
+#elif BIT_RATE == 24
+  Wire.write(0x62);   // 24bit,MASTER MODE  01100010  left justified
+#elif BIT_RATE == 16
+  Wire.write(0x42);   // 16bit,MASTER MODE  01000010  left justified
+#endif
+  Wire.endTransmission();
+
+  delay(10);
+
+    Wire.beginTransmission(0x1a);
+  Wire.write(0x10); // clock configuration
+#if SAMPLE_RATE == 88
+  Wire.write(0xbc);
+#elif SAMPLE_RATE == 48
+  Wire.write(0x00);
+#elif SAMPLE_RATE == 44
+  Wire.write(0xa0);
+#elif SAMPLE_RATE == 22
+  Wire.write(0xe0);
+#elif SAMPLE_RATE == 8
+  Wire.write(0xac);
+#elif SAMPLE_RATE == 2
+  Wire.write(0xce);
+#endif
+  Wire.endTransmission();
+  
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x12); // digital interface active
+  Wire.write(0x01);
+  Wire.endTransmission();
+
+  delay(10);
+
+    Wire.beginTransmission(0x1a);
+  Wire.write(0x0a); // digital audio path configuration
+  Wire.write((uint8_t)ADCHPD);
+  Wire.endTransmission();
+
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x00); // left in setup register
+  Wire.write((uint8_t)LINVOL);
+  Wire.endTransmission();
+
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x02); // right in setup register
+  Wire.write((uint8_t)RINVOL);
+  Wire.endTransmission();
+
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x04); // left headphone out register
+  Wire.write((uint8_t)LHPVOL);
+  Wire.endTransmission();
+
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x06); // right headphone out register
+  Wire.write((uint8_t)RHPVOL);
+  Wire.endTransmission();
+
+  delay(10);
+
+  Wire.beginTransmission(0x1a);
+  Wire.write(0x08); // analog audio pathway configuration
+  Wire.write((uint8_t)((SIDEATT << 6) | (SIDETONE << 5) | (DACSEL << 4) | (BYPASS << 3) | (INSEL << 2) | (MUTEMIC << 1) | (MICBOOST << 0)));
+  Wire.endTransmission();
+
+  delay(50);
+
+  Serial.println( "codec initialised" );
+} 
+// end initialisecodec
+
