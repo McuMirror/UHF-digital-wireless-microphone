@@ -27,9 +27,9 @@ http://yxit.co.uk/source/documentation/classIMA__ADPCM.html
 
 It early days, don't expect this code to work at all !!
 
-I will update its status to working if and when i get there.
+Fo now the example code is just about working in 8 bit only sending 1 sample every 4.
 
-Any help with timing SSC and encoding ( building packets / timstamp ideas ) much welcome
+I will update this readme when IMA_PCM is working shortly and post radio config file.
 
 
 
