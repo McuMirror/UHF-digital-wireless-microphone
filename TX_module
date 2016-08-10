@@ -1,3 +1,4 @@
+
 // Recieve I2S audio from codec over arduino due SSC
 // Encode each 16bit sample into an IMA_ADPCM 4 bit smaple
 // build 1 byte out of 2 x EMA_ADPCM samples and add it to the circular buffer.
@@ -10,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <math.h>
+
 
 
 // include libraries for UHF tx
@@ -25,55 +29,49 @@ RH_RF24 rf24(10,2); // pin 10 cs , pin 2 irq
 // obstantiate IMA_ADPCM codec
 IMA_ADPCM encoderADPCM;  // make IMA_ADPCM instance for encoder
 
-
 // define & include stuff that libltc needs here
 #include "ltc.h"
 #include "encoder.h"
 #include "decoder.h"
 
-// other variables for packet handling
+// variables for samples & packet handling
 
-uint16_t samples[48]; // resized 32 bit word to 16bit buffer
-int16_t tempsamples[48]; // tempory space to get samples out of circular bufffer into encoder.. encoder wants a buffer.. 
-uint8_t tempadpcm[24]; // pull out 48 bytes of adpcm samples from circular buffer 2
+uint8_t samples[50]; // resized unsigned 32 bit word to signed 16bit buffer ready for IMA_ADPCM encoder
+uint8_t packetheader;
+int8_t mediumpacket[50]; // the 24bit origianl in 32bit word is signed.
+uint8_t smallpacket;
+uint8_t len = 48; // RF packet leghth
+uint32_t readValue; // 32bit read value for circular buffer
 
-short unsigned int packet[2];  // 2 byte array to store 2 returned 4 bit ADPCM samples
-uint8_t radiopacket = 0;
-uint8_t adpcm[24];
-uint8_t buffcount = 0; // for packet
-uint8_t packetcount = 0; // samples loaded into circular buffer
-uint8_t flag = 0;
+// counters to help with timing 
+int buffcount = 0; // for packet
+int counter = 0;
+int flag = 0;
+int sampleready =0;
 
 // define structures of circular buffer for samples IO
 
-#define MAX_ITEMS 1920  // maximum curcular buffer size
+#define MAX_ITEMS 512  // maximum curcular buffer size
 typedef struct circularQueue_s
 {
     int    first;
     int     last;
     int    validItems;
-    uint16_t  data[MAX_ITEMS];  // i chaged the buffer from int to uint8_t 
+   uint32_t  data[MAX_ITEMS];  // i chaged the buffer from int to uint8_t 
 } circularQueue_t;
 
-// prototypes of the functions // i don't understnad this part , need to learn !
-
+// prototypes circular buffer functions
 void initializeQueue(circularQueue_t *theQueue);
-
 int isEmpty(circularQueue_t *theQueue);
-
 int putItem(circularQueue_t *theQueue, int theItemValue);
-
 int getItem(circularQueue_t *theQueue, int *theItemValue);
-
 void printQueue(circularQueue_t *theQueue);
-
-// end prototyping of functions for circular buffer,.,. don'r understand what thet are yet..
+// end prototyping of functions for circular buffer,..
 
 // circular buffer , difine a buffer , I think you can have more than one ?
 circularQueue_t myQueue;
 
-circularQueue_t adpcmQueue; // lets try and define another circular buffer and see if it works ! 
-
+//  circularQueue_t adpcmQueue; // 2nd circular buffer, how do I customize the array data type though?
 
 int samplesperframe = 1920;  // 48000khz / 25fps , samples per frame
 LTCDecoder *decoder;  // should this be a pointer ? 
@@ -100,18 +98,31 @@ LTCDecoder *decoder;  // should this be a pointer ?
 
 #include <HiFi.h>
 
+// prototyoe codecRxReadyInterrupt codecTxReadyInterrupt functions
 void codecTxReadyInterrupt(HiFiChannelID_t);
 void codecRxReadyInterrupt(HiFiChannelID_t);
 
 uint32_t ldat = 0;
 uint32_t rdat = 0;
 
+// ---- end I2S lib -------
+
+
+// ------- protoype functions for compressing samples and TX
+
+// decode incoming uint8_t samples that contain LTC
+void ltcDECODE();
+
+
+
+// ------- END user prototyping --------------
+
 
 void setup() {
 
 /// initialise the circular buffer myQu
 initializeQueue(&myQueue); // initialise buffer
-initializeQueue(&adpcmQueue); // lets try anotherm not using yet but will try it
+// initializeQueue(&adpcmQueue); // lets try anotherm not using yet but will try it
 
 
   initialcodec();  // initialize audio codec hardware
@@ -119,7 +130,7 @@ initializeQueue(&adpcmQueue); // lets try anotherm not using yet but will try it
 // create ltc decoder called decoder with n samples per frame
   decoder = ltc_decoder_create(samplesperframe, 0);  
 
-  Serial.begin(115200);
+   Serial.begin(115200);
 
  // Initialize the Arduino SSC codec
 
@@ -151,20 +162,25 @@ initializeQueue(&adpcmQueue); // lets try anotherm not using yet but will try it
   HiFi.enableRx(true);
   HiFi.enableTx(true);
 
-// Finally initialze UHF RF24 TX module
+// initialze UHF RF24 TX module
 
 rf24.init();  // initialize rf module
  
 //  rf24.setModemConfig(RH_RF24::GFSK_Rb150Fd300);  // GFSK_Rb5Fd10 // GFSK_Rb150Fd300
 //  rf24.setFrequency(434.00);  //
 // rf24.setTxPower(0x05);
+
+ rf24.setModemConfig(RH_RF24::GFSK_Rb150Fd300);
+
  rf24.printRegisters(); // dump config info to serial port
-}
+ delay(100);
 
+/// ------
 
+ 
+}  //// ----------- END void SETUP
 
 /// circular buffer functions start here
-
 
 // initialiseQueue function for circular buffer , set everything to zero
 void initializeQueue(circularQueue_t *theQueue)
@@ -195,7 +211,7 @@ int isEmpty(circularQueue_t *theQueue)
 // at the end of the queue (theQueue->last element). Then it updates the value of theQueue->last 
 // the modulus operator is needed to stay into the boundaries of the array.
 
-int putItem(circularQueue_t *theQueue, uint16_t theItemValue)
+int putItem(circularQueue_t *theQueue, uint32_t theItemValue)
 {
     if(theQueue->validItems>=MAX_ITEMS)
     {
@@ -214,7 +230,7 @@ int putItem(circularQueue_t *theQueue, uint16_t theItemValue)
 // getItem function returns -1 if the queue is empty, otherwise it takes the first element into the queue, 
 // then it updates the number of items and the first element of the queue (look at modulus operator).
 
-int getItem(circularQueue_t *theQueue, uint16_t *theItemValue)
+int getItem(circularQueue_t *theQueue, uint32_t *theItemValue)
 {
     if(isEmpty(theQueue))
     {
@@ -229,7 +245,6 @@ int getItem(circularQueue_t *theQueue, uint16_t *theItemValue)
         return(0);
     }
 }
-
 
 // printQueue function, simply, prints validItems elements of theQueue starting from the theQueue->first element.
 // maybe I can modify this for the rf24.send(&data, len); and do away with the printQueue function
@@ -250,112 +265,122 @@ void printQueue(circularQueue_t *theQueue)
 }
 /// end circular buffer functions
 
-void loop()  {
+
+void loop() 
+
+{
+ 
+if ( counter = 1 )
+{
+  buffcount++;
+ 
   
- uint16_t readValue; // read from circular buffer 
- uint8_t len = 1;
+// Serial.print("buffcount: ");
+// Serial.println(buffcount);
+// Serial.print("ldat: ");
+// Serial.println(ldat);
 
-// LOAD 16 bit samples into circular buffer
+putItem(&myQueue, ldat); // put incoming samples from i2s in circular buffer
+}
 
- if (flag = 1 && ldat > 0 )  // sample ready ?
- {
- samples[buffcount] = ((ldat >> 16) & 0xffff);  // ruduce 32it sample to unsigned 16 bit
- putItem(&myQueue, samples[buffcount]);   // load samples into circular buffer
- buffcount++;
- flag = 0; // processed smaple , falg = 0 where done , wait for another sample from I2S inturrupt.
+if ( counter = 3 )
+{
+counter = 0;
+getItem(&myQueue, &readValue);
+
+samples[buffcount] = (unsigned)readValue >> 24; /// watch out put back to readValue 
+
+ 
+ //Serial.print("ldat: ");
+ // Serial.println(ldat,HEX);
+ //Serial.print(" : ");
+ //Serial.println(ldat,BIN);
+ 
+// Serial.print("signed int8: ");
+// Serial.print(mediumpacket[buffcount]);
+// Serial.print(" : ");
+// Serial.println(mediumpacket[buffcount],BIN);
+ 
+ // Serial.print("unsigned int: ");
+ // Serial.println(samples[buffcount]); // testing only
+// Serial.print(" : ");
+// Serial.println(samples[buffcount],BIN); // testing only
+ 
+}
+
+if ( buffcount >= 48 )
+{
+ 
+samples[0] = packetheader;
+ packetheader++;
+if ( packetheader >= 255 ) { packetheader = 0; }
+  
+rf24.send(samples, len); // send 47 byte packet over RF24
+// rf24.waitPacketSent();
+Serial.print("packet sent :)");
+Serial.println(packetheader);
+buffcount = 0;
  }
  
- if ( buffcount >= 48 )  // if there are 48 samples ?
+} // end void
+
+
+/// I2S READ WRITE functions
+
+ void codecTxReadyInterrupt(HiFiChannelID_t channel)
  {
- buffcount = 0;  // reset buffercount 
- packetcount = 1; // samples ready to be processed
- }
- 
-// When Circular buffer has 48 samples, encode them and send them in 24 byte packet with 48 IAM_ADPCM samples. 
-if ( packetcount = 1 )
-{
-  encoderADPCM.EncodeInit(tempsamples[1],tempsamples[2]); // do we need this for adpcm prediction or something 
-
-for(int i=0; i<48; i++) // load samples from buffer into tempsamples
-{
- getItem(&myQueue, &readValue);  // get next available 16 bit sample from buffer
- tempsamples[i] = readValue;     // load samples into tempsamples int16_t array ( encoderADPCM.Encode needs signed int ) 
-tempadpcm[i] = encoderADPCM.Encode (tempsamples[i]);   // encode samples to IMA_ADPCM
-packetcount = 2;
-}
-}
- 
-if ( packetcount = 2 )
-{
-// extract least significant 4 bits from alternate samples from adpcm[i] and pack 2 adpcm smaples into 1 byte in adpcm array
-for(int i=0; i<48; i = i + 2) 
-{
-adpcm[i] = ((tempadpcm[i]) | (tempadpcm[i+1] << 4));   // use the | 'or' and bitshift  ? 
-Serial.println(adpcm[i]);  // should be 8 bits here.. change this to print binary .. 
-}
-packetcount = 3;
-}
-
-// send 24 bytes adpcm array
-if ( packetcount = 3 )
-{
-rf24.send(adpcm, sizeof (adpcm)); // sending 24 byte packet of 48 adpcm 4bit samples
-rf24.waitPacketSent();  // need this or not ?
-packetcount = 0;
-}
-
-
-}  // end void loop
-
-
-/// ignore ltc code for now
-
- // LTC timecode
- 
- //  ltc_decoder_write_u16 (decoder, &samples[buffcount],1, 1);  // write 1 16 bit sample to LibLTC decoder 
- //   buffcount = 0; // reset buff counter  
- //   LTCFrameExt frame;
- //   if (ltc_decoder_read (decoder, &frame) > 0) {
- //             SMPTETimecode stime;
- //             ltc_frame_to_time(&stime, &frame.ltc, 1);
- //             Serial.print(stime.hours);
- //             Serial.print(stime.mins);
- //             Serial.print(stime.secs);
- //             Serial.print(stime.frame);
- //    }  
- //    }
-
-void codecTxReadyInterrupt(HiFiChannelID_t channel)
-{
   if (channel == HIFI_CHANNEL_ID_1)
   {
     // Left channel
-   //  HiFi.write(ldat);
-     
+      HiFi.write(ldat); 
+    
+   
   }
   else
   {
     // Right channel
-   HiFi.write(rdat);
+    HiFi.write(rdat);
+    
   }
-}
+ }
 
 void codecRxReadyInterrupt(HiFiChannelID_t channel)
 {
   if (channel == HIFI_CHANNEL_ID_1)
   {
     // Left channel
-    ldat = HiFi.read(); 
-    flag = 1;
-  
+   ldat = HiFi.read();
+   counter ++;
+   
   }
   else
   {
     // Right channel
- //   rdat = HiFi.read();  
+     rdat = HiFi.read();
+
+     
    }  
 }
 
+
+void ltcDECODE()
+{
+/// ignore ltc code for now , will probebly get schedualed in another task
+
+  ltc_decoder_write(decoder, samples,1, 47);  // write 1 16 bit sample to LibLTC decoder 
+  buffcount = 0; // reset buff counter  
+  LTCFrameExt frame;
+  if (ltc_decoder_read (decoder, &frame) > 0) {
+   SMPTETimecode stime;
+              ltc_frame_to_time(&stime, &frame.ltc, 1);
+              Serial.print(stime.hours);
+              Serial.print(stime.mins);
+              Serial.print(stime.secs);
+              Serial.print(stime.frame);
+     }  
+  }  // END ltcDECODE
+ 
+  
 
 void initialcodec() {
   
@@ -380,15 +405,19 @@ void initialcodec() {
   delay(10);
 
    Wire.beginTransmission(0x1a);
-  Wire.write(0x0e); // digital data format REG 00001110   0x0e
-#if BIT_RATE == 32
-  Wire.write(0x72);  // 32bit,MASTER MODE  01110010  left justified
+  Wire.write(0x0e); // digital data format REG 00001110   0x0e    
+
+#if BIT_RATE == 32  // needs to be an if not elif ( else if ? ) 
+  Wire.write(0x72);  // 32bit,MASTER MODE  ' 01110010  left justified = 0x72 works /// I2S mode test  10110010 = B2 does'nt work !!
+
 #elif BIT_RATE == 24
   Wire.write(0x62);   // 24bit,MASTER MODE  01100010  left justified
+
 #elif BIT_RATE == 16
   Wire.write(0x42);   // 16bit,MASTER MODE  01000010  left justified
+
 #endif
-  Wire.endTransmission();
+ Wire.endTransmission();
 
   delay(10);
 
@@ -417,8 +446,8 @@ void initialcodec() {
   Wire.endTransmission();
 
   delay(10);
-
-    Wire.beginTransmission(0x1a);
+ 
+  Wire.beginTransmission(0x1a);
   Wire.write(0x0a); // digital audio path configuration
   Wire.write((uint8_t)ADCHPD);
   Wire.endTransmission();
