@@ -7,7 +7,6 @@
 //  if RSSI is = module1 is used otherwise strongest RSSI recieves 48 bit packet
 // 
 
-
 // include 2wire ( i2c )
 #include <Wire.h>
 
@@ -15,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <math.h>
 
 // include libraries for UHF tx
 #include <SPI.h>
@@ -38,16 +39,16 @@ IMA_ADPCM decoderADPCM;  // make IMA_ADPCM instance for decoder
 
 // define structures of circular buffer for samples IO
 
-#define MAX_ITEMS 128  // maximum curcular buffer size
+#define MAX_ITEMS 512  // maximum curcular buffer size
 typedef struct circularQueue_s
 {
     uint8_t     first;
     uint8_t     last;
     uint8_t    validItems;
-    uint8_t  data[MAX_ITEMS];  // i chaged the buffer from int to uint8_t 
+    uint32_t  data[MAX_ITEMS];  // i chaged the buffer from int to uint8_t 
 } circularQueue_t;
 
-uint8_t readValue;  // circular buffer read
+uint32_t readValue;  // circular buffer read
 
 // prototypes of the functions // i don't understand this part , need to learn more
 // and explain here.. 
@@ -61,22 +62,18 @@ void printQueue(circularQueue_t *theQueue);
 // end prototyping of functions for circular buffer,., explination needed...
 
 // circular buffer , difine a buffer? , I think you can have more than one ?
-circularQueue_t   myQueue;
+circularQueue_t myQueue;
 
-// uint32_t humpty[50];  // not used at the moment..
-uint16_t samples[48]; // 16bit word
+int8_t mediumsamples[50]; // signed 8bit
+uint32_t samples[50]; // 32bit samples
+uint8_t packetmod1[50];   // recieve packet from module1
+uint8_t packetmod2[50];   // recieve packet from module2
 
-int16_t tempsamples[48]; /// temp adpcm samples recieved
-uint8_t tempadpcm[24]; // 4bit samples in least significant from decoder in 1 byte at a time.
-
-uint8_t packetmod1[48];   // recieve packet from module1
-uint8_t packetmod2[48];   // recieve packet from module2
+uint8_t packetheadercount = 0;
+uint8_t packetheader[255];
 
 int flag = 1;  // rssi winner slect module
 int buffcount = 0;
-int packetready = 0;
-
- int modcheck = 0;
 
 uint8_t RSSI1 = 2;
 uint8_t RSSI2 = 1;
@@ -100,7 +97,6 @@ LTCDecoder *decoder;  //
 #define MICBOOST 1
 #define SAMPLE_RATE 48
 #define BIT_RATE 32  // 16 24 or 32 bit modes  (  SSC I2S lib wants 32bit per channel, less bitrate is left justified in 32bit )
-
 
 // I2S IO library 
 
@@ -166,15 +162,16 @@ delay(100);
  
  //  rf24module1.setTxPower(0x05);
  //  rf24module2.setTxPower(0x05);
+
+ rf24module1.setModemConfig(RH_RF24::GFSK_Rb150Fd300);
+ rf24module2.setModemConfig(RH_RF24::GFSK_Rb150Fd300);
  
  rf24module1.printRegisters(); // dump config module1 serial port
  rf24module2.printRegisters(); // dump config module2 serial port
 
 }
 
-
 /// circular buffer functions start here
-
 
 // initialiseQueue function for circular buffer , set everything to zero
 void initializeQueue(circularQueue_t *theQueue)
@@ -200,12 +197,11 @@ int isEmpty(circularQueue_t *theQueue)
         return(0);
 }
 
-
 // putItem function, verifies if there is space in the queue, and, in this case, add an item
 // at the end of the queue (theQueue->last element). Then it updates the value of theQueue->last 
 // the modulus operator is needed to stay into the boundaries of the array.
 
-int putItem(circularQueue_t *theQueue, uint8_t theItemValue)
+int putItem(circularQueue_t *theQueue, uint32_t theItemValue)
 {
     if(theQueue->validItems>=MAX_ITEMS)
     {
@@ -224,7 +220,7 @@ int putItem(circularQueue_t *theQueue, uint8_t theItemValue)
 // getItem function returns -1 if the queue is empty, otherwise it takes the first element into the queue, 
 // then it updates the number of items and the first element of the queue (look at modulus operator).
 
-int getItem(circularQueue_t *theQueue, uint8_t *theItemValue)
+int getItem(circularQueue_t *theQueue, uint32_t *theItemValue)
 {
     if(isEmpty(theQueue))
     {
@@ -239,7 +235,6 @@ int getItem(circularQueue_t *theQueue, uint8_t *theItemValue)
         return(0);
     }
 }
-
 
 // printQueue function, simply, prints validItems elements of theQueue starting from the theQueue->first element.
 // maybe I can modify this for the rf24.send(&data, len); and do away with the printQueue function
@@ -260,91 +255,61 @@ void printQueue(circularQueue_t *theQueue)
 }
 /// end circular buffer functions
 
-
-
 void loop() 
-
- {
-
-
-
-// which modue has the better RSSI ?
-
+{
+// USS RSSI best pack later.. 
 
 if (rf24module1.available())
-  {
-    
-    uint8_t buf[RH_RF24_MAX_MESSAGE_LEN];
-    uint8_t len = sizeof(buf);
-     if (rf24module1.recv(packetmod1, &len))
+    {    
+   uint8_t len = 48;
+if (rf24module1.recv(packetmod1, &len))
     {
-      
-  //     Serial.print("RSSI mod2: ");
- // Serial.println((uint8_t)rf24module1.lastRssi(), DEC);
-      RSSI1 = ((uint8_t)rf24module1.lastRssi(), DEC);
+     //  Serial.println("packet recieved from mod1");
+ RSSI1 = ((uint8_t)rf24module1.lastRssi(), DEC);
+ 
+    flag = 1;   ////////////////////////////////////// flag being set even if there is no new packet !!!!!!
       }
-      }
+    } 
   
-if (rf24module2.available())
-  {
-    
-    uint8_t buf[RH_RF24_MAX_MESSAGE_LEN];
-    uint8_t len = sizeof(buf);
-    if (rf24module2.recv(packetmod2, &len))
-    {  
-     
- //     Serial.print("RSSI mod1: ");
- // Serial.println((uint8_t)rf24module2.lastRssi(), DEC);
-     RSSI2 = ((uint8_t)rf24module2.lastRssi(), DEC);
-     
-      }
-      }
-    
+//  if (rf24module2.available())
+//   {
+//  uint8_t len = 48;
+//   if (rf24module2.recv(packetmod2, &len))
+//      {  
+//        Serial.println("packet recieved from mod2");
+// RSSI2 = ((uint8_t)rf24module2.lastRssi(), DEC);
+//    flag = 2;
+//      }
+//   }  
 // got RSSI values from each module, which has a better signal ?
 
-if (RSSI1 > RSSI2 && buffcount == 0 );
+if (packetheader[packetheadercount-1] != packetmod1[0]) // should be if ( RRSI1 >= RRSI2 ) etc 
 {
-  for(int i=0; i<24; i++) 
-     putItem(&myQueue, packetmod1[i]);   // load sample into circular buffer 
-}
 
-if (RSSI2 >= RSSI1 && buffcount == 0 );
-{
-  for(int i=0; i<24; i++) 
-  putItem(&myQueue, packetmod2[i]);   // load sample into circular buffer 
-}
+  // Serial.print("packet order check: ");
+  // Serial.println(packetheader[packetheadercount-1]);
+  // Serial.print("recieved packet header: ");
+  // Serial.println(packetmod1[0]);
+  
+  
+  packetheader[packetheadercount] = packetmod1[0];
+  packetheadercount++;
+  
+  for ( int a = 1; a < 48; a++ )
+  {
+   samples[a] = (unsigned)packetmod1[a] << 24;
+   putItem(&myQueue, samples[a]);
+  }
+  buffcount = 0;
+  flag = 0;
 
-if (flag == 1 )
-{
-for(int i=0; i<24; i++)
- {
-getItem(&myQueue, &readValue);  // get next available item from buffer
-tempsamples[i] = readValue;
- }
+} 
 
- // extract the last 4 bits then the fists 4 bits to make 48 samples of adpcm[i]
-for(int i=0; i<48; i = i + 2) 
-{
-tempadpcm[i] = tempsamples[i] << 4; // least significant 4 bits come first
-tempadpcm[i+1] = tempsamples[i];   // most significant bits 2nd
-}
+buffcount++;
+getItem(&myQueue, &readValue);
+// Serial.println(readValue,BIN);
 
-// decode ADPCM samples
-for(int i=0; i<24; i++) 
-{
-samples[i] = decoderADPCM.Decode (tempadpcm[i]); 
-}
-
-}
-
-ldat = ((samples[buffcount]) << 16);
-if ( ldat > 0) Serial.println(ldat);  // should be 8 bits here.. change this to print binary ..
-if ( buffcount >= 48 ) buffcount = 0;
-flag = 0; // got packet , reset flag if used.
-
-
-}  // close void loop 
-
+}  // end void loop 
 
 /// I2S IO loopthrough functions
  void codecTxReadyInterrupt(HiFiChannelID_t channel)
@@ -352,14 +317,13 @@ flag = 0; // got packet , reset flag if used.
   if (channel == HIFI_CHANNEL_ID_1)
   {
     // Left channel
-   HiFi.write(ldat);
-   flag = 1;
-   buffcount++;
+    
+    HiFi.write(readValue);
   }
   else
   {
     // Right channel
-    //  HiFi.write(rdat);
+    HiFi.write(rdat);
   }
 }
 
@@ -368,7 +332,7 @@ void codecRxReadyInterrupt(HiFiChannelID_t channel)
   if (channel == HIFI_CHANNEL_ID_1)
   {
     //  Left channel
-    // ldat = HiFi.read(); 
+     ldat = HiFi.read(); 
     
   }
   else
